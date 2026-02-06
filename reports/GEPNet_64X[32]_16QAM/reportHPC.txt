@@ -1,0 +1,4 @@
+number Of train samples: 10000000
+number Of batches in an epoch: 78125
+epoch, loss, trainAcc 
+

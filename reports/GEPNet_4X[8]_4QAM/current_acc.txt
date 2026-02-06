@@ -1,0 +1,1 @@
+current SER: 3.051757812500001e-05,M:4,NT_val:8,SNR:18.0,QAM:4
