@@ -2,73 +2,74 @@ import torch
 import torch.nn as nn
 
 
-class EP (object):
-    def __init__(self, H, y, sigma2, user_num, constellation,batch_size):   
+class EP:
+    def __init__(self, H, y, sigma2, user_num, constellation, batch_size):
         self.H = H
         self.y = y
         self.sigma2 = sigma2
         self.user_num = user_num
         self.batch_size = batch_size
         self.constellation = constellation
-        self.soft_max = nn.Softmax(dim=2)        
-        self.constellation_expanded = constellation.tile(self.batch_size,1).unsqueeze(2)
-        self.constellation_expanded_transpose = constellation.tile(self.batch_size,user_num,1)
+        self.soft_max = nn.Softmax(dim=2)
 
-    def calculate_mean_var(self,pyx, alpha, beta):
-        mean = torch.matmul(pyx, self.constellation_expanded)*alpha
+        self.constellation_expanded = constellation.tile(batch_size, 1).unsqueeze(2)
+        self.constellation_expanded_transpose = constellation.tile(batch_size, user_num, 1)
+
+    def calculate_mean_var(self, pyx, alpha, beta):
+        mean = torch.matmul(pyx, self.constellation_expanded) * alpha
         var = torch.square(torch.abs(self.constellation_expanded_transpose - mean))
-        var = torch.mul(pyx, var) 
-        var = torch.sum(var, axis=2)*beta
+        var = torch.mul(pyx, var)
+        var = torch.sum(var, axis=2) * beta
         return torch.squeeze(mean), var
-            
 
-    def LMMSE(self,diag_lamda, H, y, sigma2, lamda, gamma):
-        HtH = torch.matmul(H.permute(0,2,1), H)
-        Hty = torch.squeeze(torch.matmul(H.permute(0,2,1), torch.unsqueeze(y,2)))
-        torch.einsum('ijj->ij',diag_lamda)[...] = lamda*sigma2
-        var = (torch.linalg.inv(HtH + diag_lamda )) 
-        mean = ((Hty) + gamma* sigma2)
-        mean = torch.matmul(var,torch.unsqueeze(mean,2))
-        var = var* torch.unsqueeze(sigma2,2)
-        del diag_lamda
-        del HtH
-        del Hty
+    def LMMSE(self, diag_lamda, H, y, sigma2, lamda, gamma):
+        # H is rectangular for MIMO: [batch, Nr_real, Nt_real].
+        HtH = torch.matmul(H.permute(0, 2, 1), H)
+        Hty = torch.squeeze(
+            torch.matmul(H.permute(0, 2, 1), torch.unsqueeze(y, 2)), dim=2
+        )
+
+        sigma2_b = sigma2.reshape(-1, 1, 1)
+        torch.einsum("ijj->ij", diag_lamda)[...] = lamda * sigma2_b.squeeze(-1)
+
+        var = torch.linalg.inv(HtH + diag_lamda)
+        mean = torch.matmul(
+            var, torch.unsqueeze(Hty + gamma * sigma2_b.squeeze(-1), 2)
+        )
+        var = var * sigma2_b
         return mean, var
 
-    def performEP(self,eta,diag_lamda, p_y_x_GNN, mean_ab_prev, var_ab_prev, lamda_prev, gamma_prev, iter_num, alpha, beta, k, l):
-    
-        if (iter_num == 0):
+    def performEP(
+        self, eta, diag_lamda, p_y_x_GNN, mean_ab_prev, var_ab_prev,
+        lamda_prev, gamma_prev, iter_num, alpha, beta, k, l
+    ):
+        if iter_num == 0:
             lamda = lamda_prev.squeeze()
             gamma = gamma_prev.squeeze()
         else:
-            # Calculating mean and variance of \hat{P}_x_y
             p_y_x_GNN = self.soft_max(p_y_x_GNN)
             mean_b, var_b = self.calculate_mean_var(p_y_x_GNN, alpha, beta)
             var_b = torch.clamp(var_b, 1e-13, None)
-            
-            # Calculating new lamda and gamma
-            lamda = k*(1/var_b - 1/var_ab_prev)
-            gamma = l*(mean_b /var_b - mean_ab_prev/ var_ab_prev )       
-            
-            
-            # Avoiding negative lamda and gamma
-            if torch.any(lamda < 0):
-                indices = torch.where(lamda<0)
-                lamda[indices]=lamda_prev[indices]
-                gamma[indices]=gamma_prev[indices]
-                
-                
-            # Updating lamda and gamma
-            lamda = eta*lamda_prev + (1-eta)*lamda
-            gamma = eta*gamma_prev + (1-eta)*gamma
-        
-        mean_mmse, var_mmse = self.LMMSE(diag_lamda,self.H, self.y, self.sigma2, lamda, gamma)
 
-        var_ab = 1 / (1/torch.diagonal(var_mmse, dim1=1, dim2=2) - lamda )
+            lamda_new = k * (1 / var_b - 1 / var_ab_prev)
+            gamma_new = l * (mean_b / var_b - mean_ab_prev / var_ab_prev)
+
+            bad = lamda_new < 0
+            lamda_new = torch.where(bad, lamda_prev, lamda_new)
+            gamma_new = torch.where(bad, gamma_prev, gamma_new)
+
+            lamda = eta * lamda_prev + (1 - eta) * lamda_new
+            gamma = eta * gamma_prev + (1 - eta) * gamma_new
+
+        mean_mmse, var_mmse = self.LMMSE(
+            diag_lamda, self.H, self.y, self.sigma2, lamda, gamma
+        )
+
+        diag_var = torch.diagonal(var_mmse, dim1=1, dim2=2)
+        var_ab = 1 / (1 / diag_var - lamda)
         var_ab = torch.clamp(var_ab, 1e-13, None)
-            
-        mean_ab = torch.squeeze(mean_mmse)/torch.diagonal(var_mmse, dim1=1, dim2=2) - gamma
-        mean_ab = var_ab * mean_ab
-    
 
-        return  mean_ab, var_ab, lamda, gamma
+        mean_ab = torch.squeeze(mean_mmse) / diag_var - gamma
+        mean_ab = var_ab * mean_ab
+
+        return mean_ab, var_ab, lamda, gamma
